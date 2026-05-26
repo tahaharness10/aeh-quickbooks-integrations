@@ -1,2 +1,10 @@
-__pycache__
-quickbooksVenv
+__pycache__/
+*.pyc
+quickbooksVenv/
+venv310/
+
+# Local env and secrets — never commit these
+.env
+qb-sync/.env
+*service_account*.json
+.DS_Store
