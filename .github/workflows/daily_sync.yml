@@ -37,7 +37,7 @@ jobs:
       # This step writes the new token back to the GitHub Variable so
       # tomorrow's run doesn't fail with an expired token.
       - name: Persist rotated refresh token
-        if: steps.sync.outputs.new_refresh_token != ''
+        if: always() && steps.sync.outputs.new_refresh_token != ''
         run: |
           gh variable set QUICKBOOKS_REFRESH_TOKEN --body "${{ steps.sync.outputs.new_refresh_token }}"
         env:

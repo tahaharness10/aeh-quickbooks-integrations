@@ -78,17 +78,17 @@ def main():
 
     qb, auth_client = build_qb_client()
 
-    vendors = fetch_all(Vendor, qb)
-    customers = fetch_all(Customer, qb)
-
-    # QuickBooks rotates the refresh token on every use — surface the new one
-    # so the workflow can persist it before the old one expires.
+    # Emit the rotated token immediately after auth so it's persisted even if
+    # later steps (data fetch, Sheets write) fail.
     new_token = getattr(auth_client, 'refresh_token', None)
     if new_token and new_token != original_token:
         print("Refresh token rotated — emitting new token to workflow output")
         emit_github_output('new_refresh_token', new_token)
     else:
         emit_github_output('new_refresh_token', '')
+
+    vendors = fetch_all(Vendor, qb)
+    customers = fetch_all(Customer, qb)
 
     gc = build_sheets_client()
     spreadsheet = gc.open(os.environ.get('GOOGLE_SHEET_NAME', 'Najmi_QH_Balances'))
