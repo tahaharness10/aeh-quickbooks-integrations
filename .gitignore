@@ -7,4 +7,7 @@ venv310/
 .env
 qb-sync/.env
 *service_account*.json
+intuitexport-7f9b00f7297e.json
+constants.py
+intuit_auth_client.py
 .DS_Store
