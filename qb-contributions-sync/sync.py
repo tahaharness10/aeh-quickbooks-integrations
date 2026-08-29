@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import requests
 import gspread
@@ -15,6 +16,35 @@ load_dotenv()
 QB_BASE_URL = 'https://quickbooks.api.intuit.com'
 DEFAULT_CATEGORIES = 'Sabil ul khair,Faizul Mawaidil Burhaniya'
 DEFAULT_SHEET_NAME = 'Najmi_Contributions'
+NO_YEAR_LABEL = 'Year Not Available'
+
+# Regex per category (matched on substring, case-insensitive) to extract a
+# Hijri-year bucket from the transaction memo. Both patterns match either a
+# single year (1447) or a year range (1447-48). For Sabil we prefer the single
+# year; for Faiz we prefer the range but fall back to the single year.
+YEAR_RE = re.compile(r'(14\d{2})(?:\s*[-–—]\s*(\d{2}))?')
+
+# Map Arabic-Indic and Extended Arabic-Indic digits → Latin digits so the same
+# regex works regardless of memo encoding.
+_ARABIC_DIGIT_MAP = str.maketrans('٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹', '01234567890123456789')
+
+
+def normalize_memo(memo):
+    return (memo or '').translate(_ARABIC_DIGIT_MAP)
+
+
+def extract_year_bucket(memo, category_name):
+    """Return a normalized year-bucket string (e.g. '1447' or '1447-48') or None."""
+    normalized = normalize_memo(memo)
+    m = YEAR_RE.search(normalized)
+    if not m:
+        return None
+    year, tail = m.group(1), m.group(2)
+    lower = category_name.lower()
+    if 'faiz' in lower and tail:
+        return f"{year}-{tail}"
+    # Sabil (or default): use single year even if a range was written
+    return year
 
 
 def build_qb_client():
@@ -35,19 +65,29 @@ def build_qb_client():
 
 
 def find_account_family(qb, category_name):
-    """Return Accounts matching the category — the account itself plus any sub-accounts."""
+    """Return Accounts matching the category (case-insensitive) — the account itself plus any sub-accounts."""
     esc = category_name.replace("'", "\\'")
     candidates = Account.query(
         f"SELECT Id, Name, FullyQualifiedName, AccountType FROM Account "
         f"WHERE FullyQualifiedName LIKE '{esc}%'",
         qb=qb,
     )
+    target_lower = category_name.lower()
     matches = []
     for a in candidates:
-        fqn = a.FullyQualifiedName or ''
-        if fqn == category_name or fqn.startswith(f"{category_name}:"):
+        fqn = (a.FullyQualifiedName or '').lower()
+        if fqn == target_lower or fqn.startswith(f"{target_lower}:"):
             matches.append(a)
     return matches
+
+
+def list_income_accounts(qb):
+    """List all Income accounts to help the user find the right names."""
+    return Account.query(
+        "SELECT Id, Name, FullyQualifiedName, AccountType, Classification FROM Account "
+        "WHERE Classification = 'Revenue'",
+        qb=qb,
+    )
 
 
 def fetch_general_ledger(access_token, company_id, account_ids, start_date, end_date):
@@ -84,25 +124,19 @@ def _walk_data_rows(rows):
             yield from _walk_data_rows(nested.get('Row', []))
 
 
-def aggregate_by_customer(report_json):
+def aggregate_by_customer_and_year(report_json, category_name):
+    """Returns (totals, years_seen, row_count).
+    totals: {customer: {year_bucket: {'total': float, 'count': int}}}
+    years_seen: set of year buckets encountered (year strings + possibly NO_YEAR_LABEL)
+    """
     name_idx = _column_index(report_json, 'Name')
     amount_idx = _column_index(report_json, 'Amount')
-    if name_idx is None or amount_idx is None:
-        # Fall back to common defaults from Columns metadata if titles vary
-        columns = report_json.get('Columns', {}).get('Column', [])
-        col_types = [c.get('ColType', '') for c in columns]
-        if name_idx is None:
-            for i, t in enumerate(col_types):
-                if t in ('String',) and columns[i].get('ColTitle', '').lower() in ('name', 'customer'):
-                    name_idx = i
-                    break
-        if amount_idx is None:
-            for i, t in enumerate(col_types):
-                if t == 'Money':
-                    amount_idx = i
-                    break
+    memo_idx = _column_index(report_json, 'Memo/Description')
+    if memo_idx is None:
+        memo_idx = _column_index(report_json, 'Memo')
 
-    totals = defaultdict(lambda: {'total': 0.0, 'count': 0})
+    totals = defaultdict(lambda: defaultdict(lambda: {'total': 0.0, 'count': 0}))
+    years_seen = set()
     all_rows = list(_walk_data_rows(report_json.get('Rows', {}).get('Row', [])))
     for row in all_rows:
         col_data = row.get('ColData', [])
@@ -110,6 +144,13 @@ def aggregate_by_customer(report_json):
         if name_idx is not None and name_idx < len(col_data):
             name = (col_data[name_idx].get('value') or '').strip()
         name = name or '(No Customer)'
+
+        memo = ''
+        if memo_idx is not None and memo_idx < len(col_data):
+            memo = (col_data[memo_idx].get('value') or '').strip()
+
+        year_bucket = extract_year_bucket(memo, category_name) or NO_YEAR_LABEL
+
         amount_raw = ''
         if amount_idx is not None and amount_idx < len(col_data):
             amount_raw = col_data[amount_idx].get('value') or ''
@@ -117,9 +158,19 @@ def aggregate_by_customer(report_json):
             amount = float(amount_raw) if amount_raw else 0.0
         except ValueError:
             amount = 0.0
-        totals[name]['total'] += amount
-        totals[name]['count'] += 1
-    return totals, len(all_rows)
+
+        totals[name][year_bucket]['total'] += amount
+        totals[name][year_bucket]['count'] += 1
+        years_seen.add(year_bucket)
+    return totals, years_seen, len(all_rows)
+
+
+def ordered_year_columns(years_seen):
+    """Sort year buckets chronologically; put NO_YEAR_LABEL at the end."""
+    years = sorted(y for y in years_seen if y != NO_YEAR_LABEL)
+    if NO_YEAR_LABEL in years_seen:
+        years.append(NO_YEAR_LABEL)
+    return years
 
 
 def build_sheets_client():
@@ -167,8 +218,17 @@ def main():
 
     new_token = getattr(auth_client, 'refresh_token', None)
     if new_token and new_token != original_token:
-        print("Refresh token rotated — emitting new token to workflow output")
-        emit_github_output('new_refresh_token', new_token)
+        if os.getenv('GITHUB_OUTPUT'):
+            print("Refresh token rotated — emitting new token to workflow output")
+            emit_github_output('new_refresh_token', new_token)
+        else:
+            print("\n" + "=" * 70)
+            print("REFRESH TOKEN ROTATED (local run) — update both places below:")
+            print(f"  NEW TOKEN: {new_token}")
+            print("\n  1. Local .env — replace QUICKBOOKS_REFRESH_TOKEN with the value above")
+            print("  2. GitHub Variable — run:")
+            print(f"     gh variable set QUICKBOOKS_REFRESH_TOKEN --body '{new_token}'")
+            print("=" * 70 + "\n")
     else:
         emit_github_output('new_refresh_token', '')
 
@@ -186,11 +246,18 @@ def main():
     spreadsheet = gc.open(os.environ.get('GOOGLE_SHEET_NAME', DEFAULT_SHEET_NAME))
     generated_at = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
 
+    all_income = None
     for category in categories:
         print(f"\nProcessing: {category}")
         accounts = find_account_family(qb, category)
         if not accounts:
-            print(f"  WARNING: No accounts matched '{category}' — skipping")
+            if all_income is None:
+                all_income = list_income_accounts(qb)
+                print(f"\n  --- Available income (Revenue) accounts in QB ({len(all_income)} total) ---")
+                for a in sorted(all_income, key=lambda x: x.FullyQualifiedName or ''):
+                    print(f"    {a.FullyQualifiedName}")
+                print("  --- end list ---\n")
+            print(f"  WARNING: No accounts matched '{category}' — see list above for actual names")
             continue
         account_ids = [a.Id for a in accounts]
         print(f"  Matched accounts: {[a.FullyQualifiedName for a in accounts]}")
@@ -202,30 +269,64 @@ def main():
             start_date,
             end_date,
         )
-        totals, row_count = aggregate_by_customer(report)
-        print(f"  {row_count} transaction lines, {len(totals)} distinct customers")
+        totals, years_seen, row_count = aggregate_by_customer_and_year(report, category)
+        year_cols = ordered_year_columns(years_seen)
+        print(f"  {row_count} transaction lines, {len(totals)} distinct customers, "
+              f"{len(year_cols)} year bucket(s): {year_cols}")
 
-        sorted_customers = sorted(totals.items(), key=lambda kv: kv[1]['total'], reverse=True)
-        sheet_rows = [
-            [name, round(v['total'], 2), v['count']]
-            for name, v in sorted_customers
-        ]
-        grand_total = round(sum(v['total'] for v in totals.values()), 2)
+        # Build per-customer rows with per-year totals + a grand-total column for sorting
+        customer_rows = []
+        for name, year_totals in totals.items():
+            per_year = {y: year_totals.get(y, {'total': 0.0, 'count': 0})['total'] for y in year_cols}
+            cust_total = sum(per_year.values())
+            cust_count = sum(year_totals.get(y, {'total': 0.0, 'count': 0})['count'] for y in year_cols)
+            customer_rows.append((name, per_year, cust_total, cust_count))
+        customer_rows.sort(key=lambda r: r[2], reverse=True)
+        grand_total = round(sum(r[2] for r in customer_rows), 2)
+        per_year_totals = {y: round(sum(r[1][y] for r in customer_rows), 2) for y in year_cols}
+
+        # --- Terminal print (pivot) ---
+        name_col_width = max((len(name) for name, _, _, _ in customer_rows), default=8)
+        name_col_width = min(max(name_col_width, 8), 32)
+        year_col_width = 12
+        header_cells = [f"{y:>{year_col_width}}" for y in year_cols] + [f"{'Total':>{year_col_width}}", f"{'Txns':>5}"]
+        print(f"  {'Customer'.ljust(name_col_width)}  " + '  '.join(header_cells))
+        divider = f"  {'-' * name_col_width}  " + '  '.join('-' * year_col_width for _ in year_cols) + f"  {'-' * year_col_width}  {'-' * 5}"
+        print(divider)
+        for name, per_year, cust_total, cust_count in customer_rows:
+            display_name = name if len(name) <= name_col_width else name[:name_col_width - 1] + '…'
+            cells = [f"{per_year[y]:>{year_col_width},.2f}" if per_year[y] else f"{'':>{year_col_width}}" for y in year_cols]
+            cells.append(f"{round(cust_total, 2):>{year_col_width},.2f}")
+            cells.append(f"{cust_count:>5}")
+            print(f"  {display_name.ljust(name_col_width)}  " + '  '.join(cells))
+        print(divider)
+        total_cells = [f"{per_year_totals[y]:>{year_col_width},.2f}" for y in year_cols]
+        total_cells.append(f"{grand_total:>{year_col_width},.2f}")
+        print(f"  {'GRAND TOTAL'.ljust(name_col_width)}  " + '  '.join(total_cells))
+
+        # --- Sheet write (pivot) ---
+        sheet_header = ['Customer'] + year_cols + ['Total', 'Txn Count']
+        sheet_rows = []
+        for name, per_year, cust_total, cust_count in customer_rows:
+            row = [name] + [round(per_year[y], 2) if per_year[y] else '' for y in year_cols]
+            row += [round(cust_total, 2), cust_count]
+            sheet_rows.append(row)
+        # Totals row
+        sheet_rows.append(['TOTAL'] + [per_year_totals[y] for y in year_cols] + [grand_total, ''])
 
         tab_title = category[:99]
-        ws = ensure_worksheet(spreadsheet, tab_title, rows=max(len(sheet_rows) + 10, 100))
+        ws = ensure_worksheet(spreadsheet, tab_title, rows=max(len(sheet_rows) + 10, 100), cols=max(len(sheet_header) + 1, 5))
         write_sheet(
             ws,
-            ['Customer', 'Total Contribution', 'Transaction Count'],
+            sheet_header,
             sheet_rows,
             footer_lines=[
                 f'Date range: {start_date} to {end_date}',
-                f'Grand total: {grand_total}',
                 f'Source accounts: {", ".join(a.FullyQualifiedName for a in accounts)}',
+                f'Year detection pattern: {YEAR_RE.pattern} (Faiz keeps year-range, Sabil/default keeps year only)',
                 f'Generated: {generated_at}',
             ],
         )
-        print(f"  Grand total: {grand_total}")
 
     print("\nDone")
 
