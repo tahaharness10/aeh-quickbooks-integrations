@@ -1,6 +1,10 @@
 import os
 import json
+import random
+import time
+
 import gspread
+import requests
 from dotenv import load_dotenv
 from intuitlib.client import AuthClient
 from quickbooks import QuickBooks
@@ -9,6 +13,37 @@ from quickbooks.objects.customer import Customer
 from google.oauth2.service_account import Credentials
 
 load_dotenv()
+
+
+# Google's Sheets/Drive APIs intermittently return 503/429 under load. A single
+# blip used to abort the whole daily run, so transient failures are retried with
+# exponential backoff + jitter before we give up.
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 5
+
+
+def _is_retryable(err):
+    if isinstance(err, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    # APIError.code comes from the JSON body and is -1 when Google returns an
+    # HTML error page, so key off the real HTTP status instead.
+    if isinstance(err, gspread.exceptions.APIError):
+        return err.response.status_code in RETRYABLE_STATUS
+    return False
+
+
+def retry_api(description, fn, *args, **kwargs):
+    """Run a Google API call, retrying transient failures."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as err:
+            if not _is_retryable(err) or attempt == MAX_ATTEMPTS:
+                raise
+            delay = min(2 ** (attempt - 1), 16) + random.uniform(0, 1)
+            print(f"{description} failed ({err}); retrying in {delay:.1f}s "
+                  f"[attempt {attempt}/{MAX_ATTEMPTS - 1}]", flush=True)
+            time.sleep(delay)
 
 
 def build_qb_client():
@@ -59,10 +94,10 @@ def build_sheets_client():
 
 
 def write_sheet(worksheet, header, rows):
-    worksheet.clear()
-    worksheet.append_row(header)
+    retry_api('clear worksheet', worksheet.clear)
+    retry_api('write header', worksheet.append_row, header)
     if rows:
-        worksheet.append_rows(rows)
+        retry_api('write rows', worksheet.append_rows, rows)
 
 
 def emit_github_output(key, value):
@@ -91,15 +126,19 @@ def main():
     customers = fetch_all(Customer, qb)
 
     gc = build_sheets_client()
-    spreadsheet = gc.open(os.environ.get('GOOGLE_SHEET_NAME', 'Najmi_QH_Balances'))
+    spreadsheet = retry_api(
+        'open spreadsheet',
+        gc.open,
+        os.environ.get('GOOGLE_SHEET_NAME', 'Najmi_QH_Balances'),
+    )
 
     write_sheet(
-        spreadsheet.worksheet('Sheet1'),
+        retry_api('open Sheet1', spreadsheet.worksheet, 'Sheet1'),
         ['ID', 'Name', 'Balance'],
         [[v.Id, v.DisplayName, v.Balance] for v in vendors],
     )
     write_sheet(
-        spreadsheet.worksheet('Sheet2'),
+        retry_api('open Sheet2', spreadsheet.worksheet, 'Sheet2'),
         ['ID', 'Name', 'Balance'],
         [[c.Id, c.DisplayName, c.Balance] for c in customers],
     )

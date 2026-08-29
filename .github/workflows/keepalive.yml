@@ -1,0 +1,69 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows after 60 days with no repository activity.
+# That silently killed the QuickBooks syncs for 12 days (2026-08-17 → 2026-08-28):
+# the last commit before the gap was 2026-06-16, exactly 60 days before the final
+# scheduled run on 2026-08-16.
+#
+# This job runs weekly and pushes a no-op timestamp commit ONLY when the repo has
+# been quiet for over 40 days, resetting the clock well before the 60-day cutoff
+# without adding commit noise during normal development.
+#
+# It also re-enables the sync workflows, so if they ever do get disabled you can
+# recover everything by manually dispatching this one workflow.
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'   # 05:00 UTC every Monday
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      # Push as a real user via GH_PAT — a GITHUB_TOKEN-authored push does not
+      # reliably count as the "repository activity" that resets the 60-day timer.
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Push keepalive commit if repo has been quiet
+        run: |
+          set -euo pipefail
+          QUIET_DAYS=40
+
+          last_commit_ts=$(git log -1 --format=%ct)
+          age_days=$(( ( $(date +%s) - last_commit_ts ) / 86400 ))
+          echo "Last commit was ${age_days} day(s) ago (threshold: ${QUIET_DAYS})."
+
+          if [ "$age_days" -lt "$QUIET_DAYS" ]; then
+            echo "Repo is active — no keepalive commit needed."
+            exit 0
+          fi
+
+          echo "Repo quiet for ${age_days} days — pushing keepalive commit."
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .github/last-keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/last-keepalive
+          git commit -m "chore: keepalive — keep scheduled workflows enabled"
+          git push
+
+      - name: Re-enable sync workflows if inactivity disabled them
+        if: always()
+        continue-on-error: true
+        run: |
+          for wf in daily_sync.yml contributions_sync.yml; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/$wf" -q .state 2>/dev/null || echo unknown)
+            echo "$wf: $state"
+            if [ "$state" != "active" ] && [ "$state" != "unknown" ]; then
+              echo "  re-enabling $wf"
+              gh workflow enable "$wf"
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}

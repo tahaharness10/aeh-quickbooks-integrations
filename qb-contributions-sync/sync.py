@@ -1,6 +1,9 @@
 import os
 import re
 import json
+import random
+import time
+
 import requests
 import gspread
 from datetime import datetime, date
@@ -12,6 +15,37 @@ from quickbooks.objects.account import Account
 from google.oauth2.service_account import Credentials
 
 load_dotenv()
+
+
+# Google's Sheets/Drive APIs intermittently return 503/429 under load. A single
+# blip used to abort the whole daily run, so transient failures are retried with
+# exponential backoff + jitter before we give up.
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 5
+
+
+def _is_retryable(err):
+    if isinstance(err, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    # APIError.code comes from the JSON body and is -1 when Google returns an
+    # HTML error page, so key off the real HTTP status instead.
+    if isinstance(err, gspread.exceptions.APIError):
+        return err.response.status_code in RETRYABLE_STATUS
+    return False
+
+
+def retry_api(description, fn, *args, **kwargs):
+    """Run a Google API call, retrying transient failures."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as err:
+            if not _is_retryable(err) or attempt == MAX_ATTEMPTS:
+                raise
+            delay = min(2 ** (attempt - 1), 16) + random.uniform(0, 1)
+            print(f"{description} failed ({err}); retrying in {delay:.1f}s "
+                  f"[attempt {attempt}/{MAX_ATTEMPTS - 1}]", flush=True)
+            time.sleep(delay)
 
 QB_BASE_URL = 'https://quickbooks.api.intuit.com'
 DEFAULT_CATEGORIES = 'Sabil ul khair,Faizul Mawaidil Burhaniya'
@@ -190,19 +224,22 @@ def build_sheets_client():
 
 def ensure_worksheet(spreadsheet, title, rows=200, cols=5):
     try:
-        return spreadsheet.worksheet(title)
+        return retry_api(f'open worksheet {title!r}', spreadsheet.worksheet, title)
     except gspread.WorksheetNotFound:
-        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+        return retry_api(
+            f'create worksheet {title!r}',
+            spreadsheet.add_worksheet, title=title, rows=rows, cols=cols,
+        )
 
 
 def write_sheet(worksheet, header, rows, footer_lines):
-    worksheet.clear()
-    worksheet.append_row(header)
+    retry_api('clear worksheet', worksheet.clear)
+    retry_api('write header', worksheet.append_row, header)
     if rows:
-        worksheet.append_rows(rows)
-    worksheet.append_row([])
+        retry_api('write rows', worksheet.append_rows, rows)
+    retry_api('write spacer', worksheet.append_row, [])
     for line in footer_lines:
-        worksheet.append_row([line])
+        retry_api('write footer', worksheet.append_row, [line])
 
 
 def emit_github_output(key, value):
@@ -243,7 +280,11 @@ def main():
     end_date = os.environ.get('CONTRIBUTIONS_END_DATE') or today.isoformat()
 
     gc = build_sheets_client()
-    spreadsheet = gc.open(os.environ.get('GOOGLE_SHEET_NAME', DEFAULT_SHEET_NAME))
+    spreadsheet = retry_api(
+        'open spreadsheet',
+        gc.open,
+        os.environ.get('GOOGLE_SHEET_NAME', DEFAULT_SHEET_NAME),
+    )
     generated_at = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
 
     all_income = None

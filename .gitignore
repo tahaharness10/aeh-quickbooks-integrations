@@ -3,6 +3,7 @@ __pycache__/
 quickbooksVenv/
 venv310/
 venv/
+.venv/
 qb-contributions-sync/.env
 
 # Local env and secrets — never commit these
