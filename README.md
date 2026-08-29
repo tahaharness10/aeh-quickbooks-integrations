@@ -3,9 +3,9 @@
 (Please note that I have used a third party library for cofiguring quickbooks client along with intuit-oauth client. I have used them and modified them for my use case and don't own any copyrights for the same.)
 
 1. To Clone the Repo:
-   `https://github.com/sedhha/qb-oauth-python.git`
+   `git clone git@github.com:tahaharness10/aeh-quickbooks-integrations.git`
 2. Cd into the root directory:
-   `cd qb-oauth-python`
+   `cd aeh-quickbooks-integrations`
 3. Setup the virtual Enviroment:
    `python -m venv quickbooksVenv`
 4. Launch Virtual Enviroment

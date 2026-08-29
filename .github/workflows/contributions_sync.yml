@@ -1,0 +1,44 @@
+name: Daily Contributions Sync
+
+on:
+  schedule:
+    - cron: '30 7 * * *'   # 7:30am UTC daily — staggered ~1.5h after daily_sync to avoid refresh-token races
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-python@v5.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r qb-contributions-sync/requirements.txt
+
+      - name: Run contributions sync
+        id: sync
+        working-directory: qb-contributions-sync
+        run: python sync.py
+        env:
+          QUICKBOOKS_CLIENT_ID: ${{ secrets.QUICKBOOKS_CLIENT_ID }}
+          QUICKBOOKS_CLIENT_SECRET: ${{ secrets.QUICKBOOKS_CLIENT_SECRET }}
+          QUICKBOOKS_REFRESH_TOKEN: ${{ vars.QUICKBOOKS_REFRESH_TOKEN }}
+          QUICKBOOKS_COMPANY_ID: ${{ secrets.QUICKBOOKS_COMPANY_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_NAME: ${{ vars.CONTRIBUTIONS_SHEET_NAME }}
+          CONTRIBUTION_ACCOUNTS: ${{ vars.CONTRIBUTION_ACCOUNTS }}
+
+      # QuickBooks rotates the refresh token on every API call — persist the new one
+      # back to the shared repo Variable so the next scheduled run doesn't fail.
+      - name: Persist rotated refresh token
+        if: always() && steps.sync.outputs.new_refresh_token != ''
+        run: |
+          gh variable set QUICKBOOKS_REFRESH_TOKEN --body "${{ steps.sync.outputs.new_refresh_token }}"
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
